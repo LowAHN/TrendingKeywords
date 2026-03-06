@@ -1,0 +1,76 @@
+name: Build Windows & Mac
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pywebview pyinstaller requests feedparser openpyxl
+
+      - name: Build exe
+        run: |
+          pyinstaller --name TrendingKeywords --windowed --onefile --noconfirm --clean --hidden-import webview --hidden-import requests --hidden-import feedparser --hidden-import openpyxl --collect-all webview --collect-all feedparser --collect-all openpyxl app.py
+
+      - name: Upload Windows exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrendingKeywords-Windows
+          path: dist/TrendingKeywords.exe
+
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pywebview pyinstaller requests feedparser openpyxl
+
+      - name: Build app
+        run: |
+          pyinstaller --name TrendingKeywords --windowed --onedir --noconfirm --clean --hidden-import webview --hidden-import requests --hidden-import feedparser --hidden-import openpyxl --collect-all webview --collect-all feedparser --collect-all openpyxl app.py
+
+      - name: Create DMG
+        run: |
+          mkdir dmg_temp
+          cp -R dist/TrendingKeywords.app dmg_temp/ 2>/dev/null || cp -R dist/TrendingKeywords dmg_temp/TrendingKeywords.app 2>/dev/null
+          ln -s /Applications dmg_temp/Applications
+          hdiutil create -volname TrendingKeywords -srcfolder dmg_temp -ov -format UDZO dist/TrendingKeywords.dmg
+
+      - name: Upload Mac DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrendingKeywords-Mac
+          path: dist/TrendingKeywords.dmg
+
+  release:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            TrendingKeywords-Windows/TrendingKeywords.exe
+            TrendingKeywords-Mac/TrendingKeywords.dmg

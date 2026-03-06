@@ -1,0 +1,8 @@
+build/
+dist/
+*.spec
+__pycache__/
+results/
+*.pyc
+.DS_Store
+mac-remote-control-guide.md
