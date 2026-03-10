@@ -57,6 +57,27 @@ def get_google_suggest(seed_keywords):
     return results
 
 
+def get_naver_realtime():
+    """Signal.bz API를 통한 네이버 실시간 검색어 Top 10"""
+    keywords = []
+    try:
+        url = "https://api.signal.bz/news/realtime/"
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+        resp = req.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            state_map = {"s": "유지", "+": "상승", "-": "하락", "n": "신규"}
+            for item in data.get("top10", []):
+                keywords.append({
+                    "rank": item.get("rank", 0),
+                    "keyword": item.get("keyword", ""),
+                    "state": state_map.get(item.get("state", ""), item.get("state", "")),
+                })
+    except Exception as e:
+        keywords.append({"rank": 0, "keyword": f"[오류] {e}", "state": ""})
+    return keywords
+
+
 def get_naver_suggest(seed_keywords):
     results = {}
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
@@ -96,8 +117,12 @@ class Api:
         google_trends = get_google_trending_kr()
         google_suggest = get_google_suggest(seeds)
         naver_suggest = get_naver_suggest(seeds)
+        naver_realtime = get_naver_realtime()
 
         all_keywords = []
+        for item in naver_realtime:
+            if item["keyword"] and not item["keyword"].startswith("[오류]"):
+                all_keywords.append(item["keyword"])
         for item in google_trends:
             all_keywords.append(item["keyword"])
         for suggestions in google_suggest.values():
@@ -108,6 +133,7 @@ class Api:
 
         result = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "naver_realtime": naver_realtime,
             "google_trends": google_trends,
             "google_suggest": google_suggest,
             "naver_suggest": naver_suggest,
@@ -160,6 +186,12 @@ class Api:
             lines.append(f"수집 시간: {data['timestamp']}")
             lines.append("=" * 50)
 
+            lines.append(f"\n[네이버 실시간 검색어 TOP 10]")
+            lines.append("-" * 40)
+            for item in data.get("naver_realtime", []):
+                state = f" ({item['state']})" if item.get("state") else ""
+                lines.append(f"  {item['rank']:>2}. {item['keyword']}{state}")
+
             lines.append(f"\n[구글 연관검색어]")
             lines.append("-" * 40)
             for seed, suggestions in data["google_suggest"].items():
@@ -194,9 +226,9 @@ class Api:
 
             wb = Workbook()
 
-            # 시트1: 구글 연관검색어
+            # 시트1: 네이버 실시간 검색어
             ws1 = wb.active
-            ws1.title = "구글 연관검색어"
+            ws1.title = "네이버 실시간"
             header_font = Font(bold=True, color="FFFFFF", size=11)
             header_fill = PatternFill(start_color="3B82F6", end_color="3B82F6", fill_type="solid")
             thin_border = Border(
@@ -206,18 +238,31 @@ class Api:
                 bottom=Side(style="thin", color="DDDDDD"),
             )
 
-            ws1.append(["입력 키워드", "연관 검색어"])
+            ws1.append(["순위", "키워드", "상태"])
             for cell in ws1[1]:
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center")
+            for item in data.get("naver_realtime", []):
+                ws1.append([item["rank"], item["keyword"], item.get("state", "")])
+            ws1.column_dimensions["A"].width = 8
+            ws1.column_dimensions["B"].width = 30
+            ws1.column_dimensions["C"].width = 10
+
+            # 시트2: 구글 연관검색어
+            ws1b = wb.create_sheet("구글 연관검색어")
+            ws1b.append(["입력 키워드", "연관 검색어"])
+            for cell in ws1b[1]:
                 cell.font = header_font
                 cell.fill = header_fill
                 cell.alignment = Alignment(horizontal="center")
             for seed, suggestions in data["google_suggest"].items():
                 for s in suggestions:
-                    ws1.append([seed, s])
-            ws1.column_dimensions["A"].width = 20
-            ws1.column_dimensions["B"].width = 40
+                    ws1b.append([seed, s])
+            ws1b.column_dimensions["A"].width = 20
+            ws1b.column_dimensions["B"].width = 40
 
-            # 시트2: 네이버 연관검색어
+            # 시트3: 네이버 연관검색어
             ws2 = wb.create_sheet("네이버 연관검색어")
             ws2.append(["입력 키워드", "연관 검색어"])
             for cell in ws2[1]:
@@ -230,8 +275,8 @@ class Api:
             ws2.column_dimensions["A"].width = 20
             ws2.column_dimensions["B"].width = 40
 
-            # 시트3: 실시간 급상승
-            ws3 = wb.create_sheet("실시간 급상승")
+            # 시트4: 구글 급상승
+            ws3 = wb.create_sheet("구글 급상승")
             ws3.append(["순위", "키워드", "검색량"])
             for cell in ws3[1]:
                 cell.font = header_font
@@ -243,7 +288,7 @@ class Api:
             ws3.column_dimensions["B"].width = 30
             ws3.column_dimensions["C"].width = 15
 
-            # 시트4: 전체 키워드
+            # 시트5: 전체 키워드
             ws4 = wb.create_sheet("전체 키워드")
             ws4.append(["번호", "키워드"])
             for cell in ws4[1]:
@@ -397,16 +442,18 @@ HTML = """
   <div class="status" id="status">준비됨 - 키워드를 입력하고 검색을 시작하세요</div>
 
   <div class="tabs">
-    <button class="tab active" onclick="showTab(0)">구글 연관검색어</button>
-    <button class="tab" onclick="showTab(1)">네이버 연관검색어</button>
-    <button class="tab" onclick="showTab(2)">실시간 급상승 (전체)</button>
-    <button class="tab" onclick="showTab(3)">전체 키워드</button>
+    <button class="tab active" onclick="showTab(0)">네이버 실시간</button>
+    <button class="tab" onclick="showTab(1)">구글 연관검색어</button>
+    <button class="tab" onclick="showTab(2)">네이버 연관검색어</button>
+    <button class="tab" onclick="showTab(3)">구글 급상승</button>
+    <button class="tab" onclick="showTab(4)">전체 키워드</button>
   </div>
 
   <div class="panel active" id="panel0"><div class="empty">검색을 시작하세요</div></div>
   <div class="panel" id="panel1"><div class="empty">검색을 시작하세요</div></div>
   <div class="panel" id="panel2"><div class="empty">검색을 시작하세요</div></div>
   <div class="panel" id="panel3"><div class="empty">검색을 시작하세요</div></div>
+  <div class="panel" id="panel4"><div class="empty">검색을 시작하세요</div></div>
 </div>
 
 <script>
@@ -447,26 +494,45 @@ async function doSearch() {
 }
 
 function renderResults(data) {
-  // 탭0: 구글 연관검색어 (입력 키워드 기반)
+  // 탭0: 네이버 실시간 검색어 (Signal.bz)
   let html = '';
-  for (const [seed, suggestions] of Object.entries(data.google_suggest)) {
-    html += '<div class="seed-group"><div class="seed-title">"' + seed + '"</div>';
-    suggestions.forEach(s => { html += '<div class="suggest-item">' + s + '</div>'; });
-    html += '</div>';
+  const stateStyle = {'상승':'color:#f6465d','하락':'color:#3b82f6','신규':'color:#f0b90b;font-weight:700','유지':'color:#848e9c'};
+  const stateIcon = {'상승':'▲','하락':'▼','신규':'NEW','유지':'−'};
+  if (data.naver_realtime && data.naver_realtime.length > 0) {
+    data.naver_realtime.forEach(item => {
+      const si = stateStyle[item.state] || 'color:#848e9c';
+      const icon = stateIcon[item.state] || '';
+      html += '<div class="keyword-item">' +
+        '<span class="keyword-num">' + item.rank + '</span>' +
+        '<span class="keyword-text">' + item.keyword + '</span>' +
+        '<span style="font-size:11px;padding:2px 8px;border-radius:20px;background:#ffffff08;' + si + '">' + icon + ' ' + item.state + '</span>' +
+      '</div>';
+    });
+  } else {
+    html += '<div class="empty">데이터 없음</div>';
   }
-  document.getElementById('panel0').innerHTML = html || '<div class="empty">데이터 없음</div>';
+  document.getElementById('panel0').innerHTML = html;
 
-  // 탭1: 네이버 연관검색어 (입력 키워드 기반)
+  // 탭1: 구글 연관검색어 (입력 키워드 기반)
   html = '';
-  for (const [seed, suggestions] of Object.entries(data.naver_suggest)) {
+  for (const [seed, suggestions] of Object.entries(data.google_suggest)) {
     html += '<div class="seed-group"><div class="seed-title">"' + seed + '"</div>';
     suggestions.forEach(s => { html += '<div class="suggest-item">' + s + '</div>'; });
     html += '</div>';
   }
   document.getElementById('panel1').innerHTML = html || '<div class="empty">데이터 없음</div>';
 
-  // 탭2: 실시간 급상승 (한국 전체, 입력 키워드 무관)
-  html = '<div style="color:#f59e0b;font-size:12px;margin-bottom:12px;padding:8px;background:#f59e0b15;border-radius:8px;">* 한국 전체 실시간 급상승 검색어 (입력 키워드와 무관)</div>';
+  // 탭2: 네이버 연관검색어 (입력 키워드 기반)
+  html = '';
+  for (const [seed, suggestions] of Object.entries(data.naver_suggest)) {
+    html += '<div class="seed-group"><div class="seed-title">"' + seed + '"</div>';
+    suggestions.forEach(s => { html += '<div class="suggest-item">' + s + '</div>'; });
+    html += '</div>';
+  }
+  document.getElementById('panel2').innerHTML = html || '<div class="empty">데이터 없음</div>';
+
+  // 탭3: 구글 급상승 (한국 전체, 입력 키워드 무관)
+  html = '';
   data.google_trends.forEach((item, i) => {
     html += '<div class="keyword-item">' +
       '<span class="keyword-num">' + (i+1) + '</span>' +
@@ -474,13 +540,14 @@ function renderResults(data) {
       (item.traffic ? '<span class="keyword-traffic">' + item.traffic + '</span>' : '') +
     '</div>';
   });
-  document.getElementById('panel2').innerHTML = html;
+  document.getElementById('panel3').innerHTML = html;
 
+  // 탭4: 전체 키워드
   html = '';
   data.all_unique_keywords.forEach(kw => {
     html += '<span class="all-keyword">' + kw + '</span>';
   });
-  document.getElementById('panel3').innerHTML = html || '<div class="empty">데이터 없음</div>';
+  document.getElementById('panel4').innerHTML = html || '<div class="empty">데이터 없음</div>';
 }
 
 async function saveFile(fileType) {
