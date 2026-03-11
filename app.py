@@ -4,12 +4,15 @@
 Windows/Mac 모두 지원
 """
 
+APP_VERSION = "1.2.0"
+GITHUB_REPO = "LowAHN/TrendingKeywords"
+
 import webview
-import threading
 import json
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import os
 
@@ -18,8 +21,6 @@ if getattr(sys, 'frozen', False):
     BASE_DIR = Path(os.path.dirname(sys.executable))
 else:
     BASE_DIR = Path(__file__).parent
-OUTPUT_DIR = BASE_DIR / "results"
-OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 # ─── 수집 함수 ───
@@ -27,12 +28,20 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 import requests as req
 import feedparser
 
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+
+def _make_session():
+    s = req.Session()
+    s.headers.update({"User-Agent": UA})
+    return s
+
 
 def get_google_trending_kr():
     keywords = []
     try:
         url = "https://trends.google.co.kr/trending/rss?geo=KR"
-        feed = feedparser.parse(url)
+        feed = feedparser.parse(url, request_headers={"User-Agent": UA})
         for entry in feed.entries[:20]:
             title = entry.get("title", "").strip()
             traffic = entry.get("ht_approx_traffic", "")
@@ -44,14 +53,17 @@ def get_google_trending_kr():
 
 
 def get_google_suggest(seed_keywords):
+    session = _make_session()
     results = {}
     for seed in seed_keywords:
         try:
             encoded = urllib.parse.quote(seed)
             url = f"https://suggestqueries.google.com/complete/search?client=firefox&hl=ko&q={encoded}"
-            resp = req.get(url, timeout=5)
+            resp = session.get(url, timeout=5)
             if resp.status_code == 200:
                 results[seed] = resp.json()[1][:10]
+            else:
+                results[seed] = []
         except Exception:
             results[seed] = []
     return results
@@ -59,11 +71,11 @@ def get_google_suggest(seed_keywords):
 
 def get_naver_realtime():
     """Signal.bz API를 통한 네이버 실시간 검색어 Top 10"""
+    session = _make_session()
     keywords = []
     try:
         url = "https://api.signal.bz/news/realtime/"
-        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-        resp = req.get(url, headers=headers, timeout=10)
+        resp = session.get(url, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             state_map = {"s": "유지", "+": "상승", "-": "하락", "n": "신규"}
@@ -79,13 +91,13 @@ def get_naver_realtime():
 
 
 def get_naver_suggest(seed_keywords):
+    session = _make_session()
     results = {}
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
     for seed in seed_keywords:
         try:
             encoded = urllib.parse.quote(seed)
             url = f"https://ac.search.naver.com/nx/ac?q={encoded}&q_enc=UTF-8&st=100&frm=nv&r_format=json&r_enc=UTF-8&r_unicode=0&t_koreng=1"
-            resp = req.get(url, headers=headers, timeout=5)
+            resp = session.get(url, timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
                 suggestions = []
@@ -94,6 +106,8 @@ def get_naver_suggest(seed_keywords):
                         if isinstance(item, list) and item:
                             suggestions.append(item[0])
                 results[seed] = suggestions[:10]
+            else:
+                results[seed] = []
         except Exception:
             results[seed] = []
     return results
@@ -109,22 +123,64 @@ class Api:
     def set_window(self, window):
         self._window = window
 
+    def get_version(self):
+        return APP_VERSION
+
+    def check_update(self):
+        try:
+            session = _make_session()
+            resp = session.get(
+                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                return {"has_update": False}
+            data = resp.json()
+            latest = data.get("tag_name", "").lstrip("v")
+            if not latest:
+                return {"has_update": False}
+            has_update = self._compare_versions(latest, APP_VERSION)
+            result = {
+                "has_update": has_update,
+                "current": APP_VERSION,
+                "latest": latest,
+                "url": data.get("html_url", ""),
+            }
+            return result
+        except Exception:
+            return {"has_update": False}
+
+    @staticmethod
+    def _compare_versions(latest, current):
+        try:
+            lat = [int(x) for x in latest.split(".")]
+            cur = [int(x) for x in current.split(".")]
+            return lat > cur
+        except ValueError:
+            return False
+
     def search(self, seeds_text):
         seeds = [s.strip() for s in seeds_text.split(",") if s.strip()]
         if not seeds:
             seeds = ["오늘", "추천", "방법", "비교", "후기", "순위"]
 
-        google_trends = get_google_trending_kr()
-        google_suggest = get_google_suggest(seeds)
-        naver_suggest = get_naver_suggest(seeds)
-        naver_realtime = get_naver_realtime()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            f1 = pool.submit(get_google_trending_kr)
+            f2 = pool.submit(get_google_suggest, seeds)
+            f3 = pool.submit(get_naver_suggest, seeds)
+            f4 = pool.submit(get_naver_realtime)
+            google_trends = f1.result()
+            google_suggest = f2.result()
+            naver_suggest = f3.result()
+            naver_realtime = f4.result()
 
         all_keywords = []
         for item in naver_realtime:
             if item["keyword"] and not item["keyword"].startswith("[오류]"):
                 all_keywords.append(item["keyword"])
         for item in google_trends:
-            all_keywords.append(item["keyword"])
+            if item["keyword"] and not item["keyword"].startswith("[오류]"):
+                all_keywords.append(item["keyword"])
         for suggestions in google_suggest.values():
             all_keywords.extend(suggestions)
         for suggestions in naver_suggest.values():
@@ -172,9 +228,7 @@ class Api:
         if not filepath:
             return {"success": False, "message": "취소됨"}
 
-        save_path = filepath if isinstance(filepath, str) else filepath[0] if filepath else None
-        if not save_path:
-            return {"success": False, "message": "취소됨"}
+        save_path = filepath if isinstance(filepath, str) else filepath[0]
 
         if file_type == "json":
             with open(save_path, "w", encoding="utf-8") as f:
@@ -222,7 +276,7 @@ class Api:
 
         elif file_type == "excel":
             from openpyxl import Workbook
-            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.styles import Font, PatternFill, Alignment
 
             wb = Workbook()
 
@@ -231,12 +285,6 @@ class Api:
             ws1.title = "네이버 실시간"
             header_font = Font(bold=True, color="FFFFFF", size=11)
             header_fill = PatternFill(start_color="3B82F6", end_color="3B82F6", fill_type="solid")
-            thin_border = Border(
-                left=Side(style="thin", color="DDDDDD"),
-                right=Side(style="thin", color="DDDDDD"),
-                top=Side(style="thin", color="DDDDDD"),
-                bottom=Side(style="thin", color="DDDDDD"),
-            )
 
             ws1.append(["순위", "키워드", "상태"])
             for cell in ws1[1]:
@@ -417,6 +465,24 @@ HTML = """
 
   .empty { color: #555; text-align: center; padding: 40px; font-size: 14px; }
 
+  .update-banner {
+    display: none; padding: 10px 16px; margin-bottom: 15px;
+    background: linear-gradient(135deg, #f59e0b22, #f59e0b11);
+    border: 1px solid #f59e0b44; border-radius: 10px;
+    font-size: 13px; color: #f59e0b;
+    align-items: center; justify-content: space-between;
+  }
+  .update-banner.show { display: flex; }
+  .update-banner a {
+    color: #3b82f6; text-decoration: none; font-weight: 600;
+    padding: 4px 12px; background: #3b82f622; border-radius: 6px;
+  }
+  .update-banner a:hover { background: #3b82f644; }
+
+  .version-info {
+    font-size: 11px; color: #555; margin-top: 12px; text-align: right;
+  }
+
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: #1e1e32; }
   ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
@@ -425,6 +491,11 @@ HTML = """
 <body>
 <div class="container">
   <h1>Trending Keywords</h1>
+
+  <div class="update-banner" id="updateBanner">
+    <span id="updateMsg"></span>
+    <a id="updateLink" href="#" target="_blank">다운로드</a>
+  </div>
 
   <div class="input-row">
     <input type="text" id="seeds" placeholder="키워드 입력 (쉼표 구분) - 예: 맛집, 여행, 다이어트"
@@ -436,7 +507,7 @@ HTML = """
     <button class="btn btn-green" id="copyBtn" onclick="copyKeywords()" disabled>키워드 복사</button>
     <button class="btn btn-purple" id="saveTxt" onclick="saveFile('txt')" disabled>TXT 저장</button>
     <button class="btn btn-purple" id="saveExcel" onclick="saveFile('excel')" disabled>엑셀 저장</button>
-    <button class="btn btn-purple" id="saveJson" onclick="saveFile('json')" disabled style="opacity:0.7">JSON 저장</button>
+    <button class="btn btn-purple" id="saveJson" onclick="saveFile('json')" disabled>JSON 저장</button>
   </div>
 
   <div class="status" id="status">준비됨 - 키워드를 입력하고 검색을 시작하세요</div>
@@ -454,14 +525,38 @@ HTML = """
   <div class="panel" id="panel2"><div class="empty">검색을 시작하세요</div></div>
   <div class="panel" id="panel3"><div class="empty">검색을 시작하세요</div></div>
   <div class="panel" id="panel4"><div class="empty">검색을 시작하세요</div></div>
+
+  <div class="version-info" id="versionInfo"></div>
 </div>
 
 <script>
 let lastResult = null;
+let isSearching = false;
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
 
 document.getElementById('seeds').addEventListener('keydown', e => {
   if (e.key === 'Enter') doSearch();
 });
+
+(async function checkUpdate() {
+  try {
+    const ver = await window.pywebview.api.get_version();
+    document.getElementById('versionInfo').textContent = 'v' + ver;
+
+    const update = await window.pywebview.api.check_update();
+    if (update && update.has_update) {
+      document.getElementById('updateMsg').textContent =
+        '새 버전 v' + update.latest + ' 사용 가능 (현재 v' + update.current + ')';
+      document.getElementById('updateLink').href = update.url;
+      document.getElementById('updateBanner').classList.add('show');
+    }
+  } catch(e) {}
+})();
 
 function showTab(i) {
   document.querySelectorAll('.tab').forEach((t, idx) => t.classList.toggle('active', idx === i));
@@ -469,6 +564,9 @@ function showTab(i) {
 }
 
 async function doSearch() {
+  if (isSearching) return;
+  isSearching = true;
+
   const btn = document.getElementById('searchBtn');
   const status = document.getElementById('status');
   btn.disabled = true;
@@ -491,6 +589,7 @@ async function doSearch() {
     status.textContent = '오류: ' + e;
   }
   btn.disabled = false;
+  isSearching = false;
 }
 
 function renderResults(data) {
@@ -503,9 +602,9 @@ function renderResults(data) {
       const si = stateStyle[item.state] || 'color:#848e9c';
       const icon = stateIcon[item.state] || '';
       html += '<div class="keyword-item">' +
-        '<span class="keyword-num">' + item.rank + '</span>' +
-        '<span class="keyword-text">' + item.keyword + '</span>' +
-        '<span style="font-size:11px;padding:2px 8px;border-radius:20px;background:#ffffff08;' + si + '">' + icon + ' ' + item.state + '</span>' +
+        '<span class="keyword-num">' + esc(String(item.rank)) + '</span>' +
+        '<span class="keyword-text">' + esc(item.keyword) + '</span>' +
+        '<span style="font-size:11px;padding:2px 8px;border-radius:20px;background:#ffffff08;' + si + '">' + icon + ' ' + esc(item.state) + '</span>' +
       '</div>';
     });
   } else {
@@ -516,8 +615,8 @@ function renderResults(data) {
   // 탭1: 구글 연관검색어 (입력 키워드 기반)
   html = '';
   for (const [seed, suggestions] of Object.entries(data.google_suggest)) {
-    html += '<div class="seed-group"><div class="seed-title">"' + seed + '"</div>';
-    suggestions.forEach(s => { html += '<div class="suggest-item">' + s + '</div>'; });
+    html += '<div class="seed-group"><div class="seed-title">"' + esc(seed) + '"</div>';
+    suggestions.forEach(s => { html += '<div class="suggest-item">' + esc(s) + '</div>'; });
     html += '</div>';
   }
   document.getElementById('panel1').innerHTML = html || '<div class="empty">데이터 없음</div>';
@@ -525,27 +624,31 @@ function renderResults(data) {
   // 탭2: 네이버 연관검색어 (입력 키워드 기반)
   html = '';
   for (const [seed, suggestions] of Object.entries(data.naver_suggest)) {
-    html += '<div class="seed-group"><div class="seed-title">"' + seed + '"</div>';
-    suggestions.forEach(s => { html += '<div class="suggest-item">' + s + '</div>'; });
+    html += '<div class="seed-group"><div class="seed-title">"' + esc(seed) + '"</div>';
+    suggestions.forEach(s => { html += '<div class="suggest-item">' + esc(s) + '</div>'; });
     html += '</div>';
   }
   document.getElementById('panel2').innerHTML = html || '<div class="empty">데이터 없음</div>';
 
   // 탭3: 구글 급상승 (한국 전체, 입력 키워드 무관)
   html = '';
-  data.google_trends.forEach((item, i) => {
-    html += '<div class="keyword-item">' +
-      '<span class="keyword-num">' + (i+1) + '</span>' +
-      '<span class="keyword-text">' + item.keyword + '</span>' +
-      (item.traffic ? '<span class="keyword-traffic">' + item.traffic + '</span>' : '') +
-    '</div>';
-  });
+  if (data.google_trends && data.google_trends.length > 0) {
+    data.google_trends.forEach((item, i) => {
+      html += '<div class="keyword-item">' +
+        '<span class="keyword-num">' + (i+1) + '</span>' +
+        '<span class="keyword-text">' + esc(item.keyword) + '</span>' +
+        (item.traffic ? '<span class="keyword-traffic">' + esc(item.traffic) + '</span>' : '') +
+      '</div>';
+    });
+  } else {
+    html = '<div class="empty">데이터 없음</div>';
+  }
   document.getElementById('panel3').innerHTML = html;
 
   // 탭4: 전체 키워드
   html = '';
   data.all_unique_keywords.forEach(kw => {
-    html += '<span class="all-keyword">' + kw + '</span>';
+    html += '<span class="all-keyword">' + esc(kw) + '</span>';
   });
   document.getElementById('panel4').innerHTML = html || '<div class="empty">데이터 없음</div>';
 }
@@ -572,6 +675,8 @@ function copyKeywords() {
   navigator.clipboard.writeText(text).then(() => {
     document.getElementById('status').textContent =
       '클립보드에 ' + lastResult.all_unique_keywords.length + '개 키워드 복사됨!';
+  }).catch(() => {
+    document.getElementById('status').textContent = '클립보드 복사 실패 (권한 필요)';
   });
 }
 </script>
