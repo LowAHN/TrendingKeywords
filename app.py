@@ -4,12 +4,15 @@
 Windows/Mac 모두 지원
 """
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 GITHUB_REPO = "LowAHN/TrendingKeywords"
 
 import webview
 import json
 import urllib.parse
+import tempfile
+import subprocess
+import platform
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -140,15 +143,123 @@ class Api:
             if not latest:
                 return {"has_update": False}
             has_update = self._compare_versions(latest, APP_VERSION)
+
+            # 현재 OS에 맞는 다운로드 URL 찾기
+            download_url = ""
+            is_mac = platform.system() == "Darwin"
+            for asset in data.get("assets", []):
+                name = asset.get("name", "")
+                if is_mac and name.endswith(".dmg"):
+                    download_url = asset.get("browser_download_url", "")
+                elif not is_mac and name.endswith(".exe"):
+                    download_url = asset.get("browser_download_url", "")
+
             result = {
                 "has_update": has_update,
                 "current": APP_VERSION,
                 "latest": latest,
                 "url": data.get("html_url", ""),
+                "download_url": download_url,
+                "can_auto_update": bool(download_url) and getattr(sys, 'frozen', False),
             }
             return result
         except Exception:
             return {"has_update": False}
+
+    def download_update(self, download_url):
+        """업데이트 파일 다운로드 (진행률 콜백)"""
+        try:
+            session = _make_session()
+            resp = session.get(download_url, stream=True, timeout=60)
+            if resp.status_code != 200:
+                return {"success": False, "message": "다운로드 실패"}
+
+            total = int(resp.headers.get("content-length", 0))
+            suffix = ".dmg" if platform.system() == "Darwin" else ".exe"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+
+            downloaded = 0
+            for chunk in resp.iter_content(chunk_size=65536):
+                tmp.write(chunk)
+                downloaded += len(chunk)
+                if total > 0 and self._window:
+                    pct = int(downloaded * 100 / total)
+                    self._window.evaluate_js(f"updateProgress({pct})")
+
+            tmp.close()
+            self._update_file = tmp.name
+            return {"success": True, "path": tmp.name}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def apply_update(self):
+        """다운로드된 업데이트 적용 후 앱 재시작"""
+        if not hasattr(self, "_update_file") or not self._update_file:
+            return {"success": False, "message": "다운로드된 업데이트 없음"}
+
+        if not getattr(sys, "frozen", False):
+            return {"success": False, "message": "개발 모드에서는 자동 업데이트 불가"}
+
+        try:
+            if platform.system() == "Darwin":
+                self._apply_mac_update()
+            else:
+                self._apply_windows_update()
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
+    def _apply_mac_update(self):
+        update_file = self._update_file
+        # .app 경로 찾기: sys.executable → .app/Contents/MacOS/binary
+        app_path = Path(sys.executable).parent.parent.parent
+        if not str(app_path).endswith(".app"):
+            raise RuntimeError(f".app 경로를 찾을 수 없음: {app_path}")
+
+        script = f"""#!/bin/bash
+sleep 2
+hdiutil attach "{update_file}" -nobrowse -quiet
+MOUNT=$(hdiutil info | grep "TrendingKeywords" | awk '{{print $NF}}')
+if [ -d "$MOUNT/TrendingKeywords.app" ]; then
+    rm -rf "{app_path}"
+    cp -R "$MOUNT/TrendingKeywords.app" "{app_path}"
+    hdiutil detach "$MOUNT" -quiet
+    rm -f "{update_file}"
+    open "{app_path}"
+else
+    hdiutil detach "$MOUNT" -quiet 2>/dev/null
+fi
+rm -f "$0"
+"""
+        script_path = tempfile.NamedTemporaryFile(
+            delete=False, suffix=".sh", mode="w"
+        )
+        script_path.write(script)
+        script_path.close()
+        os.chmod(script_path.name, 0o755)
+        subprocess.Popen(["bash", script_path.name])
+        self._window.destroy()
+
+    def _apply_windows_update(self):
+        update_file = self._update_file
+        current_exe = sys.executable
+
+        script = f"""@echo off
+timeout /t 3 /nobreak >nul
+move /y "{update_file}" "{current_exe}"
+start "" "{current_exe}"
+del "%~f0"
+"""
+        script_path = tempfile.NamedTemporaryFile(
+            delete=False, suffix=".bat", mode="w"
+        )
+        script_path.write(script)
+        script_path.close()
+        kwargs = {}
+        if platform.system() == "Windows":
+            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+        subprocess.Popen(["cmd", "/c", script_path.name], **kwargs)
+        self._window.destroy()
 
     @staticmethod
     def _compare_versions(latest, current):
@@ -470,14 +581,25 @@ HTML = """
     background: linear-gradient(135deg, #f59e0b22, #f59e0b11);
     border: 1px solid #f59e0b44; border-radius: 10px;
     font-size: 13px; color: #f59e0b;
-    align-items: center; justify-content: space-between;
+    flex-direction: column; gap: 8px;
   }
   .update-banner.show { display: flex; }
-  .update-banner a {
+  .update-top { display: flex; align-items: center; justify-content: space-between; }
+  .update-top a, .update-top button {
     color: #3b82f6; text-decoration: none; font-weight: 600;
     padding: 4px 12px; background: #3b82f622; border-radius: 6px;
+    border: none; cursor: pointer; font-size: 13px;
   }
-  .update-banner a:hover { background: #3b82f644; }
+  .update-top a:hover, .update-top button:hover { background: #3b82f644; }
+  .update-top button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .progress-bar {
+    display: none; height: 6px; background: #333; border-radius: 3px; overflow: hidden;
+  }
+  .progress-bar.show { display: block; }
+  .progress-fill {
+    height: 100%; width: 0%; background: linear-gradient(90deg, #3b82f6, #6ee7b7);
+    border-radius: 3px; transition: width 0.2s;
+  }
 
   .version-info {
     font-size: 11px; color: #555; margin-top: 12px; text-align: right;
@@ -493,8 +615,16 @@ HTML = """
   <h1>Trending Keywords</h1>
 
   <div class="update-banner" id="updateBanner">
-    <span id="updateMsg"></span>
-    <a id="updateLink" href="#" target="_blank">다운로드</a>
+    <div class="update-top">
+      <span id="updateMsg"></span>
+      <span id="updateActions">
+        <button id="updateBtn" onclick="doUpdate()">지금 업데이트</button>
+        <a id="updateLink" href="#" target="_blank" style="display:none;margin-left:6px">수동 다운로드</a>
+      </span>
+    </div>
+    <div class="progress-bar" id="progressBar">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
   </div>
 
   <div class="input-row">
@@ -543,6 +673,39 @@ document.getElementById('seeds').addEventListener('keydown', e => {
   if (e.key === 'Enter') doSearch();
 });
 
+let updateInfo = null;
+
+function updateProgress(pct) {
+  document.getElementById('progressFill').style.width = pct + '%';
+  document.getElementById('updateMsg').textContent = '다운로드 중... ' + pct + '%';
+}
+
+async function doUpdate() {
+  if (!updateInfo || !updateInfo.download_url) return;
+  const btn = document.getElementById('updateBtn');
+  btn.disabled = true;
+  btn.textContent = '다운로드 중...';
+  document.getElementById('progressBar').classList.add('show');
+
+  try {
+    const res = await window.pywebview.api.download_update(updateInfo.download_url);
+    if (res && res.success) {
+      document.getElementById('updateMsg').textContent = '설치 중... 앱이 재시작됩니다';
+      document.getElementById('progressFill').style.width = '100%';
+      btn.style.display = 'none';
+      await window.pywebview.api.apply_update();
+    } else {
+      document.getElementById('updateMsg').textContent = '다운로드 실패: ' + (res.message || '알 수 없는 오류');
+      btn.disabled = false;
+      btn.textContent = '다시 시도';
+    }
+  } catch(e) {
+    document.getElementById('updateMsg').textContent = '업데이트 오류: ' + e;
+    btn.disabled = false;
+    btn.textContent = '다시 시도';
+  }
+}
+
 (async function checkUpdate() {
   try {
     const ver = await window.pywebview.api.get_version();
@@ -550,10 +713,19 @@ document.getElementById('seeds').addEventListener('keydown', e => {
 
     const update = await window.pywebview.api.check_update();
     if (update && update.has_update) {
+      updateInfo = update;
       document.getElementById('updateMsg').textContent =
         '새 버전 v' + update.latest + ' 사용 가능 (현재 v' + update.current + ')';
-      document.getElementById('updateLink').href = update.url;
       document.getElementById('updateBanner').classList.add('show');
+
+      if (update.can_auto_update) {
+        document.getElementById('updateBtn').style.display = '';
+      } else {
+        document.getElementById('updateBtn').style.display = 'none';
+      }
+      // 수동 다운로드 링크는 항상 표시
+      document.getElementById('updateLink').href = update.url;
+      document.getElementById('updateLink').style.display = '';
     }
   } catch(e) {}
 })();
