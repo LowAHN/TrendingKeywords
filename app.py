@@ -19,12 +19,6 @@ from concurrent.futures import ThreadPoolExecutor
 import sys
 import os
 
-# 결과 저장 디렉터리
-if getattr(sys, 'frozen', False):
-    BASE_DIR = Path(os.path.dirname(sys.executable))
-else:
-    BASE_DIR = Path(__file__).parent
-
 
 # ─── 수집 함수 ───
 
@@ -168,6 +162,12 @@ class Api:
 
     def download_update(self, download_url):
         """업데이트 파일 다운로드 (진행률 콜백)"""
+        # GitHub 도메인 + 리포지토리 검증
+        allowed_prefix = f"https://github.com/{GITHUB_REPO}/"
+        if not download_url.startswith(allowed_prefix):
+            return {"success": False, "message": "허용되지 않은 다운로드 URL"}
+
+        tmp_path = None
         try:
             session = _make_session()
             resp = session.get(download_url, stream=True, timeout=60)
@@ -177,6 +177,7 @@ class Api:
             total = int(resp.headers.get("content-length", 0))
             suffix = ".dmg" if platform.system() == "Darwin" else ".exe"
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp_path = tmp.name
 
             downloaded = 0
             for chunk in resp.iter_content(chunk_size=65536):
@@ -187,9 +188,12 @@ class Api:
                     self._window.evaluate_js(f"updateProgress({pct})")
 
             tmp.close()
-            self._update_file = tmp.name
-            return {"success": True, "path": tmp.name}
+            self._update_file = tmp_path
+            return {"success": True, "path": tmp_path}
         except Exception as e:
+            # 실패 시 임시 파일 정리
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
             return {"success": False, "message": str(e)}
 
     def apply_update(self):
@@ -209,6 +213,11 @@ class Api:
         except Exception as e:
             return {"success": False, "message": str(e)}
 
+    @staticmethod
+    def _shell_escape(path):
+        """쉘 스크립트에 안전하게 경로를 삽입하기 위한 이스케이프"""
+        return str(path).replace("'", "'\\''")
+
     def _apply_mac_update(self):
         update_file = self._update_file
         # .app 경로 찾기: sys.executable → .app/Contents/MacOS/binary
@@ -216,49 +225,61 @@ class Api:
         if not str(app_path).endswith(".app"):
             raise RuntimeError(f".app 경로를 찾을 수 없음: {app_path}")
 
+        esc_update = self._shell_escape(update_file)
+        esc_app = self._shell_escape(app_path)
+
         script = f"""#!/bin/bash
 sleep 2
-hdiutil attach "{update_file}" -nobrowse -quiet
-MOUNT=$(hdiutil info | grep "TrendingKeywords" | awk '{{print $NF}}')
+MOUNT=$(hdiutil attach '{esc_update}' -nobrowse 2>/dev/null | grep '/Volumes/' | sed 's/.*\\(\\/Volumes\\/.*\\)/\\1/' | head -1)
+if [ -z "$MOUNT" ]; then
+    rm -f '{esc_update}'
+    exit 1
+fi
 if [ -d "$MOUNT/TrendingKeywords.app" ]; then
-    rm -rf "{app_path}"
-    cp -R "$MOUNT/TrendingKeywords.app" "{app_path}"
+    rm -rf '{esc_app}'
+    cp -R "$MOUNT/TrendingKeywords.app" '{esc_app}'
     hdiutil detach "$MOUNT" -quiet
-    rm -f "{update_file}"
-    open "{app_path}"
+    rm -f '{esc_update}'
+    open '{esc_app}'
 else
     hdiutil detach "$MOUNT" -quiet 2>/dev/null
+    rm -f '{esc_update}'
 fi
 rm -f "$0"
 """
-        script_path = tempfile.NamedTemporaryFile(
+        script_file = tempfile.NamedTemporaryFile(
             delete=False, suffix=".sh", mode="w"
         )
-        script_path.write(script)
-        script_path.close()
-        os.chmod(script_path.name, 0o755)
-        subprocess.Popen(["bash", script_path.name])
+        script_file.write(script)
+        script_file.close()
+        os.chmod(script_file.name, 0o755)
+        subprocess.Popen(["bash", script_file.name])
         self._window.destroy()
 
     def _apply_windows_update(self):
         update_file = self._update_file
         current_exe = sys.executable
 
+        # bat에서는 큰따옴표로 경로를 감싸면 대부분 안전
         script = f"""@echo off
 timeout /t 3 /nobreak >nul
 move /y "{update_file}" "{current_exe}"
+if errorlevel 1 (
+    del /f "{update_file}"
+    exit /b 1
+)
 start "" "{current_exe}"
 del "%~f0"
 """
-        script_path = tempfile.NamedTemporaryFile(
+        script_file = tempfile.NamedTemporaryFile(
             delete=False, suffix=".bat", mode="w"
         )
-        script_path.write(script)
-        script_path.close()
+        script_file.write(script)
+        script_file.close()
         kwargs = {}
         if platform.system() == "Windows":
             kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-        subprocess.Popen(["cmd", "/c", script_path.name], **kwargs)
+        subprocess.Popen(["cmd", "/c", script_file.name], **kwargs)
         self._window.destroy()
 
     @staticmethod
@@ -266,6 +287,10 @@ del "%~f0"
         try:
             lat = [int(x) for x in latest.split(".")]
             cur = [int(x) for x in current.split(".")]
+            # 세그먼트 길이를 맞춰서 비교 (1.1 == 1.1.0)
+            max_len = max(len(lat), len(cur))
+            lat.extend([0] * (max_len - len(lat)))
+            cur.extend([0] * (max_len - len(cur)))
             return lat > cur
         except ValueError:
             return False
@@ -341,6 +366,12 @@ del "%~f0"
 
         save_path = filepath if isinstance(filepath, str) else filepath[0]
 
+        try:
+            return self._write_file(file_type, save_path, data)
+        except Exception as e:
+            return {"success": False, "message": f"저장 실패: {e}"}
+
+    def _write_file(self, file_type, save_path, data):
         if file_type == "json":
             with open(save_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -682,6 +713,7 @@ function updateProgress(pct) {
 
 async function doUpdate() {
   if (!updateInfo || !updateInfo.download_url) return;
+  if (!confirm('v' + updateInfo.latest + ' 버전으로 업데이트하시겠습니까?\\n앱이 재시작됩니다.')) return;
   const btn = document.getElementById('updateBtn');
   btn.disabled = true;
   btn.textContent = '다운로드 중...';

@@ -26,7 +26,6 @@ def build_app():
         "--onedir",
         "--noconfirm",
         "--clean",
-        "--add-data", "app.py:.",
         "--hidden-import", "webview",
         "--hidden-import", "requests",
         "--hidden-import", "feedparser",
