@@ -43,7 +43,10 @@ def build_app():
 
 def create_dmg():
     print("  DMG 생성 중...")
-    app_path = DIST / APP_NAME / f"{APP_NAME}.app"
+    # PyInstaller가 .app을 dist/ 직접 또는 dist/APP_NAME/ 하위에 생성할 수 있음
+    app_path = DIST / f"{APP_NAME}.app"
+    if not app_path.exists():
+        app_path = DIST / APP_NAME / f"{APP_NAME}.app"
     dmg_path = DIST / f"{APP_NAME}.dmg"
 
     if not app_path.exists():
